@@ -9,6 +9,8 @@ Optimisations : SQLite en mode WAL, index composite, recherche plein texte FTS5
 (insensible aux accents), statistiques calculées en SQL, serveur local sans dépendance.
 """
 import argparse
+import base64
+import io
 import json
 import math
 import os
@@ -21,6 +23,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
+import zipfile
 from collections import defaultdict
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +50,11 @@ CREATE TABLE IF NOT EXISTS note(
 );
 CREATE INDEX IF NOT EXISTS idx_note_voyage_jour ON note(voyage_id, jour);
 CREATE TABLE IF NOT EXISTS reglage(cle TEXT PRIMARY KEY, valeur TEXT);
+CREATE TABLE IF NOT EXISTS photo(
+  id INTEGER PRIMARY KEY,
+  voyage_id INTEGER NOT NULL REFERENCES voyage(id) ON DELETE CASCADE,
+  jour TEXT NOT NULL, grande BLOB NOT NULL, mini BLOB NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_photo_voyage_jour ON photo(voyage_id, jour);
 """
 
 FTS = """
@@ -218,7 +226,7 @@ def cmd_suppr(db, a):
     print("Note supprimée." if cur.rowcount else "Note introuvable.")
 
 
-def exporter(db, nom, vid, fmt="md"):
+def exporter(db, nom, vid, fmt="md", images=None):
     rows = [dict(r) for r in db.execute(
         "SELECT jour,lieu,texte,humeur,depense,tags FROM note WHERE voyage_id=? ORDER BY jour,id", (vid,))]
     if fmt == "json":
@@ -226,9 +234,13 @@ def exporter(db, nom, vid, fmt="md"):
     par_jour = defaultdict(list)
     for r in rows:
         par_jour[r["jour"]].append(r)
+    for j in images or {}:
+        par_jour.setdefault(j, [])
     parts = [f"# {nom}\n"]
-    for jour, notes in par_jour.items():
+    for jour, notes in sorted(par_jour.items()):
         parts.append(f"## {jour}\n")
+        for chemin in (images or {}).get(jour, []):
+            parts.append(f"![Photo du {jour}]({chemin})\n")
         for r in notes:
             lieu = f"**{r['lieu']}** — " if r["lieu"] else ""
             extra = f" _({r['depense']:.2f} €)_" if r["depense"] else ""
@@ -446,6 +458,29 @@ kbd{border:1px solid var(--line);border-radius:5px;padding:0 6px;font:12px var(-
 #toasts{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);display:flex;flex-direction:column;gap:8px;z-index:30;align-items:center;pointer-events:none}
 .toast{pointer-events:auto;background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;display:flex;gap:16px;align-items:center;animation:pop .18s}
 .toast button{background:none;border:0;color:inherit;font-weight:700;text-decoration:underline}
+.photos{border-top:1px solid var(--line);padding:14px 0 18px}
+.entries>.entry:first-child+.photos,.entries>.nonote+.photos{margin-top:0}
+.pgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.ph{position:relative;aspect-ratio:4/3;border-radius:8px;overflow:hidden;background:var(--raised);border:1px solid var(--line)}
+.ph .open{position:absolute;inset:0;border:0;padding:0;background:none;cursor:zoom-in}
+.ph img{width:100%;height:100%;object-fit:cover;display:block}
+.ph .pdel{position:absolute;top:6px;right:6px;width:28px;height:28px;border:0;border-radius:999px;background:rgba(10,16,32,.72);color:#fff;display:grid;place-items:center;opacity:0;transition:opacity .15s}
+.ph:hover .pdel,.ph:focus-within .pdel{opacity:1}
+.ph .pdel:hover{background:var(--red)}
+@media (hover:none){.ph .pdel{opacity:1}}
+.padd,.pbar{border:2px dashed var(--line);border-radius:8px;background:none;color:var(--muted);transition:border-color .15s,color .15s}
+.padd{aspect-ratio:4/3;display:grid;place-content:center;justify-items:center;gap:2px;font-size:14px}
+.pbar{width:100%;padding:10px;display:flex;gap:8px;justify-content:center;align-items:center}
+.padd:hover,.pbar:hover{border-color:var(--blue);color:var(--blue)}
+.nonote{color:var(--muted);padding:16px 0 4px;margin:0}
+.drop{outline:2px dashed var(--blue);outline-offset:3px}
+.lb{position:fixed;inset:0;z-index:40;background:rgba(6,10,22,.97);display:grid;place-items:center;padding:24px;animation:fade .15s}
+.lb figure{margin:0;max-width:min(1100px,94vw);display:grid;gap:10px;justify-items:center}
+.lb img{max-width:100%;max-height:82vh;border-radius:8px;display:block;object-fit:contain}
+.lb figcaption{color:#cdd6ea;font-size:14px}
+.lbx,.lbn{position:absolute;border:0;background:rgba(255,255,255,.12);color:#fff;border-radius:999px;width:46px;height:46px;display:grid;place-items:center}
+.lbx{top:18px;right:18px}.lbn{top:50%;transform:translateY(-50%)}.lbn.prev{left:18px}.lbn.next{right:18px}
+.lbx:hover,.lbn:hover{background:rgba(255,255,255,.25)}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 @keyframes pop{from{opacity:0;transform:translateY(6px) scale(.98)}to{opacity:1;transform:none}}
 
@@ -484,6 +519,7 @@ kbd{border:1px solid var(--line);border-radius:5px;padding:0 6px;font:12px var(-
   <main class="main" id="main"></main>
 </div>
 <div id="toasts" aria-live="polite"></div>
+<input type="file" id="file" accept="image/*" multiple hidden>
 
 <script>
 (()=>{
@@ -502,7 +538,11 @@ const PATHS={
   theme:'<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 010 18z" fill="currentColor"/>',
   down:'<path d="M12 3v12"/><path d="M7 11l5 5 5-5"/><path d="M5 21h14"/>',
   power:'<path d="M12 3v9"/><path d="M6.3 6.3a8 8 0 1011.4 0"/>',
-  sort:'<path d="M7 4v16M7 20l-3-3M7 20l3-3"/><path d="M17 20V4M17 4l-3 3M17 4l3 3"/>'
+  sort:'<path d="M7 4v16M7 20l-3-3M7 20l3-3"/><path d="M17 20V4M17 4l-3 3M17 4l3 3"/>',
+  image:'<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M21 16l-5-5-8 8"/>',
+  close:'<path d="M6 6l12 12M18 6L6 18"/>',
+  left:'<path d="M15 5l-7 7 7 7"/>',
+  right:'<path d="M9 5l7 7-7 7"/>'
 };
 const ic=(n,s=18)=>`<svg viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${PATHS[n]}</svg>`;
 const GLOBE='<svg class="globe" viewBox="0 0 200 200" fill="none" stroke="#fff" stroke-width="1.2" aria-hidden="true"><circle cx="100" cy="100" r="90"/><ellipse cx="100" cy="100" rx="40" ry="90"/><ellipse cx="100" cy="100" rx="75" ry="90"/><path d="M10 100h180M20 60h160M20 140h160"/></svg>';
@@ -521,6 +561,7 @@ async function api(m,u,b){
   return j;
 }
 function toast(msg,action,cb){
+  const pile=$('#toasts').children;while(pile.length>=2)pile[0].remove();
   const el=document.createElement('div');el.className='toast';el.setAttribute('role','status');
   el.innerHTML=`<span>${esc(msg)}</span>`;
   if(action){const b=document.createElement('button');b.textContent=action;b.onclick=()=>{el.remove();cb()};el.append(b)}
@@ -556,6 +597,14 @@ function renderSide(){
 }
 
 /* ---------- zone principale ---------- */
+function heroActs(){
+  const v=S.d.voyage;
+  return `<button class="btn ghost" data-act="edit-voyage">${ic('edit',16)}Modifier</button>
+    <a class="btn ghost" href="/api/voyage/${v.id}/export?format=md" download>${ic('down',16)}Exporter en Markdown</a>
+    ${S.d.photos.length?`<a class="btn ghost" href="/api/voyage/${v.id}/export?format=zip" download>${ic('down',16)}Exporter avec les photos</a>`:''}
+    <a class="btn ghost" href="/api/voyage/${v.id}/export?format=json" download>${ic('down',16)}Exporter en JSON</a>
+    <button class="btn ghost" data-act="del-voyage">${ic('trash',16)}Supprimer le voyage</button>`;
+}
 function renderMain(){
   const m=$('#main');
   if(!S.voyages.length||!S.d){
@@ -570,12 +619,7 @@ function renderMain(){
       <h2>${esc(v.nom)}</h2>
       <div class="where">${esc(where(v))}</div>
       <p class="sum" id="sum"></p>
-      <div class="acts">
-        <button class="btn ghost" data-act="edit-voyage">${ic('edit',16)}Modifier</button>
-        <a class="btn ghost" href="/api/voyage/${v.id}/export?format=md" download>${ic('down',16)}Exporter en Markdown</a>
-        <a class="btn ghost" href="/api/voyage/${v.id}/export?format=json" download>${ic('down',16)}Exporter en JSON</a>
-        <button class="btn ghost" data-act="del-voyage">${ic('trash',16)}Supprimer le voyage</button>
-      </div>
+      <div class="acts" id="acts">${heroActs()}</div>
     </div>
     <div class="airmail"></div>
   </header>
@@ -589,6 +633,7 @@ function renderMain(){
       <div class="moods" id="f-moods" role="group" aria-label="Humeur">${[1,2,3,4,5].map(i=>`<button type="button" data-mood="${i}" aria-pressed="false" title="${MOODTXT[i]}" aria-label="${MOODTXT[i]}">${MOODS[i]}</button>`).join('')}</div>
       <label class="field w90"><span class="sr">Dépense en euros</span><input id="f-dep" inputmode="decimal" placeholder="Dépense €"></label>
       <label class="field grow"><span class="sr">Tags</span><input id="f-tags" placeholder="Tags : food, temple"></label>
+      <button type="button" class="btn" data-act="photo-composer" title="Ajouter des photos à la date choisie">${ic('image',16)}Photos</button>
       <button class="btn primary" id="f-submit" title="Ctrl + Entrée">Ajouter la note</button>
     </div>
   </form>
@@ -602,11 +647,12 @@ function renderMain(){
 }
 
 function summary(){
-  const s=S.d.stats;
-  if(!s.nb)return 'Ce carnet est encore vide.';
+  const s=S.d.stats,ph=S.d.photos.length;
+  if(!s.nb)return ph?`Aucune note pour l’instant, ${pl(ph,'photo')}.`:'Ce carnet est encore vide.';
   let t=`${pl(s.nb,'note')} écrite${s.nb>1?'s':''}`+(s.lieux?` dans ${pl(s.lieux,'lieu','lieux')}`:'')+'.';
   if(s.total)t+=` ${EUR.format(s.total)} dépensés`+(s.humeur?`, humeur moyenne de ${NUM1.format(s.humeur)} sur 5.`:'.');
   else if(s.humeur)t+=` Humeur moyenne de ${NUM1.format(s.humeur)} sur 5.`;
+  if(ph)t+=` ${pl(ph,'photo')}.`;
   return t;
 }
 function chart(pj){
@@ -631,31 +677,42 @@ function renderInsights(){
 }
 function updateLieux(){$('#lieux').innerHTML=S.d.lieux.map(l=>`<option value="${esc(l)}">`).join('')}
 
-function ticket(j,ns){
-  const tot=ns.reduce((a,n)=>a+n.depense,0),lieux=[...new Set(ns.map(n=>n.lieu).filter(Boolean))];
-  const dt=D(j);
-  return `<article class="ticket"><div class="stub"><span class="notch t"></span><span class="notch b"></span>
-    <div class="wd">${dt.toLocaleDateString('fr-FR',{weekday:'long'})}</div>
-    <span class="dn">${dt.getDate()}</span>
-    <div class="my">${dt.toLocaleDateString('fr-FR',{month:'long',year:'numeric'})}</div>
-    ${tot?`<div class="tot">${EUR.format(tot)}</div>`:''}
-    ${lieux.length?`<div class="pl">${esc(lieux.slice(0,3).join(', '))}</div>`:''}
-  </div><div class="entries">${ns.map(n=>`<div class="entry" data-id="${n.id}">
+const MAXP=3;
+const photosDe=j=>S.d.photos.filter(p=>p.jour===j);
+function entryHtml(n){
+  return `<div class="entry" data-id="${n.id}">
     <div class="ehead">${n.lieu?`<span class="eplace">${esc(n.lieu)}</span>`:''}${n.humeur?`<span class="emood" title="${MOODTXT[n.humeur]}">${MOODS[n.humeur]}</span>`:''}
       <span class="ecost">${n.depense?EUR.format(n.depense):''}</span>
       <span class="eact"><button class="iconbtn" data-act="edit" aria-label="Modifier la note">${ic('edit')}</button><button class="iconbtn" data-act="del" aria-label="Supprimer la note">${ic('trash')}</button></span></div>
     <p class="etext">${esc(n.texte)}</p>
     ${n.tags?`<div class="etags">${n.tags.split(',').map(t=>`<button class="tag" data-q="${esc(t)}">#${esc(t)}</button>`).join('')}</div>`:''}
-  </div>`).join('')}</div></article>`;
+  </div>`;
+}
+function photoBlock(j){
+  const ps=photosDe(j);
+  if(!ps.length)return `<div class="photos"><button class="pbar" data-act="photo-add">${ic('image',18)}Ajouter des photos (${MAXP} maximum par jour)</button></div>`;
+  return `<div class="photos"><div class="pgrid">${ps.map((p,i)=>`<div class="ph"><button class="open" data-act="photo-open" data-pid="${p.id}" aria-label="Agrandir la photo ${i+1}"><img src="/api/photo/${p.id}?v=mini" alt="Photo ${i+1} du ${esc(fCourt(j))}" loading="lazy" decoding="async"></button><button class="pdel" data-act="photo-del" data-pid="${p.id}" aria-label="Supprimer la photo ${i+1}">${ic('close',16)}</button></div>`).join('')}${ps.length<MAXP?`<button class="padd" data-act="photo-add">${ic('image',20)}<span>Ajouter une photo</span><span class="ts">${ps.length} sur ${MAXP}</span></button>`:''}</div></div>`;
+}
+function ticket(j,ns){
+  const tot=ns.reduce((a,n)=>a+n.depense,0),lieux=[...new Set(ns.map(n=>n.lieu).filter(Boolean))];
+  const dt=D(j);
+  return `<article class="ticket" data-jour="${j}"><div class="stub"><span class="notch t"></span><span class="notch b"></span>
+    <div class="wd">${dt.toLocaleDateString('fr-FR',{weekday:'long'})}</div>
+    <span class="dn">${dt.getDate()}</span>
+    <div class="my">${dt.toLocaleDateString('fr-FR',{month:'long',year:'numeric'})}</div>
+    ${tot?`<div class="tot">${EUR.format(tot)}</div>`:''}
+    ${lieux.length?`<div class="pl">${esc(lieux.slice(0,3).join(', '))}</div>`:''}
+  </div><div class="entries">${ns.length?ns.map(entryHtml).join(''):'<p class="nonote">Aucune note ce jour-là.</p>'}${photoBlock(j)}</div></article>`;
 }
 function renderTimeline(){
-  const el=$('#timeline'),notes=S.d.notes;
-  if(!notes.length){
+  const el=$('#timeline'),notes=S.d.notes,g={};
+  notes.forEach(n=>(g[n.jour]??=[]).push(n));
+  if(!S.q)S.d.photos.forEach(p=>{g[p.jour]??=[]});
+  const jours=Object.keys(g).sort();if(S.desc)jours.reverse();
+  if(!jours.length){
     el.innerHTML=S.q?`<p class="none">Aucun résultat pour « ${esc(S.q)} ».</p>`:'<p class="none">Aucune note pour l’instant. Écris la première ci-dessus.</p>';
     return;
   }
-  const g={};notes.forEach(n=>(g[n.jour]??=[]).push(n));
-  const jours=Object.keys(g).sort();if(S.desc)jours.reverse();
   el.innerHTML=(S.q?`<p class="count">${pl(notes.length,'résultat')} pour « ${esc(S.q)} »</p>`:'')+jours.map(j=>ticket(j,g[j])).join('');
 }
 function paintOrder(){const b=$('#b-order span');if(b)b.textContent=S.desc?'Plus récent d’abord':'Plus ancien d’abord'}
@@ -683,6 +740,7 @@ async function refresh(){
   const [d,v]=await Promise.all([api('GET',`voyage/${S.vid}?q=${enc(S.q)}`),api('GET','voyages')]);
   S.d=d;S.voyages=v.voyages;
   renderSide();renderInsights();renderTimeline();updateLieux();
+  const acts=$('#acts');if(acts)acts.innerHTML=heroActs();
 }
 async function select(vid){
   S.vid=vid;S.q='';S.edit=null;
@@ -693,6 +751,61 @@ async function select(vid){
   }catch(e){fail(e)}
 }
 async function reloadVoyages(){S.voyages=(await api('GET','voyages')).voyages}
+
+function b64(blob){return new Promise((ok,ko)=>{const r=new FileReader();r.onload=()=>ok(String(r.result).split(',')[1]);r.onerror=ko;r.readAsDataURL(blob)})}
+function jpeg(bmp,max,q){
+  const r=Math.min(1,max/Math.max(bmp.width,bmp.height)),w=Math.max(1,Math.round(bmp.width*r)),h=Math.max(1,Math.round(bmp.height*r));
+  const c=document.createElement('canvas');c.width=w;c.height=h;
+  const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,w,h);x.drawImage(bmp,0,0,w,h);
+  return new Promise(ok=>c.toBlob(ok,'image/jpeg',q));
+}
+async function ajouterPhotos(files,jour){
+  if(!S.vid)return;
+  const imgs=[...files].filter(f=>f.type.startsWith('image/'));
+  if(!imgs.length){toast('Choisis un fichier image.');return}
+  const libres=MAXP-photosDe(jour).length;
+  if(libres<=0){toast(`Cette journée a déjà ${MAXP} photos.`);return}
+  const prises=imgs.slice(0,libres);let ok=0;
+  try{
+    for(const f of prises){
+      let bmp;
+      try{bmp=await createImageBitmap(f,{imageOrientation:'from-image'})}catch(e){throw new Error('Format d’image non pris en charge.')}
+      const [g,m]=await Promise.all([jpeg(bmp,1600,.85),jpeg(bmp,480,.8)]);
+      if(bmp.close)bmp.close();
+      await api('POST','photo',{voyage_id:S.vid,jour,grande:await b64(g),mini:await b64(m)});ok++;
+    }
+  }catch(e){fail(e)}
+  if(ok){
+    await refresh();
+    const s=`${pl(ok,'photo')} ajoutée${ok>1?'s':''}`;
+    toast(imgs.length>prises.length?`${s}. ${MAXP} photos maximum par jour.`:s+'.');
+  }
+}
+function lightbox(pid){
+  const ph=S.d.photos.find(p=>p.id===pid);if(!ph)return;
+  const j=ph.jour,liste=photosDe(j);let i=liste.findIndex(p=>p.id===pid);
+  const el=document.createElement('div');el.className='lb';el.setAttribute('role','dialog');el.setAttribute('aria-label','Photo agrandie');
+  const draw=()=>{el.innerHTML=`<button class="lbx" data-lb="close" aria-label="Fermer">${ic('close',22)}</button>`+
+    (liste.length>1?`<button class="lbn prev" data-lb="prev" aria-label="Photo précédente">${ic('left',26)}</button><button class="lbn next" data-lb="next" aria-label="Photo suivante">${ic('right',26)}</button>`:'')+
+    `<figure><img src="/api/photo/${liste[i].id}" alt="Photo ${i+1} du ${esc(fCourt(j))}"><figcaption>${esc(fCourt(j))}, photo ${i+1} sur ${liste.length}</figcaption></figure>`};
+  const go=d=>{i=(i+d+liste.length)%liste.length;draw()};
+  const close=()=>{el.remove();document.removeEventListener('keydown',key,true)};
+  const key=e=>{
+    if(e.key==='Escape'){e.stopPropagation();close()}
+    else if(e.key==='ArrowLeft'&&liste.length>1)go(-1);
+    else if(e.key==='ArrowRight'&&liste.length>1)go(1);
+  };
+  el.addEventListener('click',e=>{
+    const a=e.target.closest('[data-lb]');const k=a?a.dataset.lb:null;
+    if(k==='prev')go(-1);else if(k==='next')go(1);else if(k==='close'||e.target===el||e.target.tagName==='FIGURE')close();
+  });
+  document.addEventListener('keydown',key,true);draw();document.body.append(el);el.querySelector('.lbx').focus();
+}
+function photoDelDialog(pid){
+  dialog(`<h3>Supprimer cette photo ?</h3><p>Cette action est définitive.</p>
+    <div class="dactions"><button type="button" class="btn" data-close>Annuler</button><button class="btn danger">Supprimer la photo</button></div>`,
+  async(f,close)=>{await api('DELETE','photo/'+pid);close();await refresh();toast('Photo supprimée.')});
+}
 
 function dialog(html,onsubmit){
   const s=document.createElement('div');s.className='scrim';
@@ -740,6 +853,10 @@ document.addEventListener('click',async e=>{
       case 'edit-voyage':voyageDialog(S.d.voyage);break;
       case 'del-voyage':deleteVoyageDialog();break;
       case 'cancel-edit':setComposer(null);break;
+      case 'photo-add':S.fileJour=t.closest('.ticket').dataset.jour;$('#file').click();break;
+      case 'photo-composer':S.fileJour=$('#f-jour').value||today();$('#file').click();break;
+      case 'photo-open':lightbox(+t.dataset.pid);break;
+      case 'photo-del':photoDelDialog(+t.dataset.pid);break;
       case 'edit':{const n=S.d.notes.find(x=>x.id===id);if(n){setComposer(n);$('#composer').scrollIntoView({behavior:'smooth',block:'center'});$('#f-texte').focus()}break}
       case 'del':{
         const n=S.d.notes.find(x=>x.id===id);if(!n)break;
@@ -782,6 +899,26 @@ document.addEventListener('keydown',e=>{
   if((e.key==='/'&&!typing)||(e.key.toLowerCase()==='k'&&(e.ctrlKey||e.metaKey))){const i=$('#q');if(i){e.preventDefault();i.focus();i.select()}}
 });
 
+$('#file').addEventListener('change',async e=>{const fs=[...e.target.files];e.target.value='';await ajouterPhotos(fs,S.fileJour||today())});
+const hasFiles=e=>e.dataTransfer&&[...e.dataTransfer.types].includes('Files');
+const clearDrop=()=>document.querySelectorAll('.drop').forEach(x=>x.classList.remove('drop'));
+document.addEventListener('dragover',e=>{
+  if(!hasFiles(e))return;e.preventDefault();clearDrop();
+  const z=e.target.closest&&e.target.closest('.ticket,.composer');if(z)z.classList.add('drop');
+});
+document.addEventListener('dragleave',e=>{if(!e.relatedTarget)clearDrop()});
+document.addEventListener('drop',e=>{
+  if(!hasFiles(e))return;e.preventDefault();clearDrop();
+  const t=e.target.closest&&e.target.closest('.ticket'),c=e.target.closest&&e.target.closest('.composer');
+  if(t)ajouterPhotos(e.dataTransfer.files,t.dataset.jour);
+  else if(c)ajouterPhotos(e.dataTransfer.files,$('#f-jour').value||today());
+});
+document.addEventListener('paste',e=>{
+  const fs=[...((e.clipboardData&&e.clipboardData.files)||[])].filter(f=>f.type.startsWith('image/'));
+  if(!fs.length||!S.vid||!$('#composer'))return;
+  e.preventDefault();ajouterPhotos(fs,$('#f-jour').value||today());
+});
+
 /* ---------- démarrage ---------- */
 async function init(){
   $('#b-new').innerHTML=ic('plus')+'Nouveau voyage';
@@ -816,8 +953,22 @@ class Erreur(Exception):
 
 
 class Fichier:
-    def __init__(self, nom, contenu, mime):
-        self.nom, self.contenu, self.mime = nom, contenu, mime
+    def __init__(self, nom, contenu, mime, cache=False):
+        self.nom, self.contenu, self.mime, self.cache = nom, contenu, mime, cache
+
+
+MAX_PHOTOS_JOUR = 3
+
+
+def decoder_jpeg(b64, maxi):
+    """Décode une image envoyée par la page ; seuls les vrais JPEG de taille raisonnable sont acceptés."""
+    try:
+        data = base64.b64decode(b64 or "", validate=True)
+    except (ValueError, TypeError):
+        raise ValueError("Image invalide.") from None
+    if not data.startswith(b"\xff\xd8\xff") or len(data) > maxi:
+        raise ValueError("Image invalide ou trop lourde.")
+    return data
 
 
 def texte(c, cle, maxi=200, requis=False):
@@ -894,7 +1045,8 @@ def detail_voyage(db, vid, q):
         "GROUP BY lieu ORDER BY nb DESC, lieu LIMIT 5", (vid,))]
     lieux = [r["lieu"] for r in db.execute(
         "SELECT DISTINCT lieu FROM note WHERE lieu IS NOT NULL ORDER BY lieu LIMIT 300")]
-    return {"voyage": dict(v), "notes": [dict(n) for n in notes], "stats": stats, "lieux": lieux}
+    photos = [dict(r) for r in db.execute("SELECT id, jour FROM photo WHERE voyage_id=? ORDER BY jour, id", (vid,))]
+    return {"voyage": dict(v), "notes": [dict(n) for n in notes], "stats": stats, "lieux": lieux, "photos": photos}
 
 
 def api(m, chemin, q, c):
@@ -956,8 +1108,18 @@ def api(m, chemin, q, c):
         v = db.execute("SELECT nom FROM voyage WHERE id=?", (vid,)).fetchone()
         if not v:
             raise Erreur(404, "Voyage introuvable.")
-        fmt = "json" if q.get("format") == "json" else "md"
+        fmt = q.get("format") if q.get("format") in ("json", "zip") else "md"
         base = re.sub(r"[^A-Za-z0-9_-]+", "_", v["nom"]).strip("_") or "carnet"
+        if fmt == "zip":  # carnet.md + dossier photos/
+            images, compteur, buf = defaultdict(list), defaultdict(int), io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:  # les JPEG sont déjà compressés
+                for f in db.execute("SELECT jour, grande FROM photo WHERE voyage_id=? ORDER BY jour, id", (vid,)):
+                    compteur[f["jour"]] += 1
+                    chemin = f"photos/{f['jour']}_{compteur[f['jour']]}.jpg"
+                    images[f["jour"]].append(chemin)
+                    z.writestr(chemin, f["grande"])
+                z.writestr(f"{base}.md", exporter(db, v["nom"], vid, "md", images).encode("utf-8"))
+            return Fichier(f"{base}.zip", buf.getvalue(), "application/zip")
         mime = "application/json" if fmt == "json" else "text/markdown"
         return Fichier(f"{base}.{fmt}", exporter(db, v["nom"], vid, fmt).encode("utf-8"), mime + "; charset=utf-8")
 
@@ -986,6 +1148,31 @@ def api(m, chemin, q, c):
             if not cur.rowcount:
                 raise Erreur(404, "Note introuvable.")
             return {"ok": True}
+    if p == ["photo"] and m == "POST":
+        vid = int(c.get("voyage_id") or 0)
+        if not db.execute("SELECT 1 FROM voyage WHERE id=?", (vid,)).fetchone():
+            raise Erreur(404, "Voyage introuvable.")
+        jour = jour_iso(c.get("jour"))
+        deja = db.execute("SELECT COUNT(*) FROM photo WHERE voyage_id=? AND jour=?", (vid, jour)).fetchone()[0]
+        if deja >= MAX_PHOTOS_JOUR:
+            raise Erreur(409, f"{MAX_PHOTOS_JOUR} photos maximum par jour.")
+        grande, mini = decoder_jpeg(c.get("grande"), 8_000_000), decoder_jpeg(c.get("mini"), 800_000)
+        with db:
+            cur = db.execute("INSERT INTO photo(voyage_id,jour,grande,mini) VALUES(?,?,?,?)", (vid, jour, grande, mini))
+        return {"id": cur.lastrowid, "jour": jour}
+    if len(p) == 2 and p[0] == "photo" and num(1):
+        pid = int(p[1])
+        if m == "GET":
+            row = db.execute("SELECT grande, mini FROM photo WHERE id=?", (pid,)).fetchone()
+            if not row:
+                raise Erreur(404, "Photo introuvable.")
+            return Fichier(None, row["mini"] if q.get("v") == "mini" else row["grande"], "image/jpeg", cache=True)
+        if m == "DELETE":
+            with db:
+                cur = db.execute("DELETE FROM photo WHERE id=?", (pid,))
+            if not cur.rowcount:
+                raise Erreur(404, "Photo introuvable.")
+            return {"ok": True}
     raise Erreur(404, "Introuvable.")
 
 
@@ -997,9 +1184,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(corps)))
-        self.send_header("Cache-Control", "no-store")
+        extra = dict(headers)
+        self.send_header("Cache-Control", extra.pop("Cache-Control", "no-store"))
         self.send_header("X-Content-Type-Options", "nosniff")
-        for k, v in headers:
+        for k, v in extra.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(corps)
@@ -1033,7 +1221,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise Erreur(404, "Page introuvable.")
             corps = {}
             if methode in ("POST", "PUT"):
-                n = min(int(self.headers.get("Content-Length") or 0), 2_000_000)
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > (14_000_000 if u.path == "/api/photo" else 2_000_000):
+                    raise Erreur(413, "Données trop volumineuses.")
                 corps = json.loads(self.rfile.read(n) or b"{}")
                 if not isinstance(corps, dict):
                     raise ValueError("Données invalides.")
@@ -1049,8 +1239,12 @@ class Handler(BaseHTTPRequestHandler):
             print("Erreur interne :", repr(e), file=sys.stderr)
             return self._json(500, {"erreur": "Erreur interne."})
         if isinstance(res, Fichier):
-            return self._envoyer(200, res.contenu, res.mime,
-                                 [("Content-Disposition", f'attachment; filename="{res.nom}"')])
+            h = []
+            if res.nom:
+                h.append(("Content-Disposition", f'attachment; filename="{res.nom}"'))
+            if res.cache:  # une photo ne change jamais : le navigateur peut la garder
+                h.append(("Cache-Control", "private, max-age=31536000, immutable"))
+            return self._envoyer(200, res.contenu, res.mime, h)
         self._json(200, res)
 
     def do_GET(self):

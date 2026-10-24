@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -80,10 +81,23 @@ class Base(sqlite3.Connection):
     has_fts = False
 
 
+def migrer(db):
+    """Ajoute les colonnes apparues depuis les anciennes versions (les données existantes sont conservées)."""
+    def colonnes(table):
+        return {r["name"] for r in db.execute(f"PRAGMA table_info({table})")}
+    if "favori" not in colonnes("note"):
+        db.execute("ALTER TABLE note ADD COLUMN favori INTEGER NOT NULL DEFAULT 0")
+    for nom, typ in (("budget", "REAL"), ("couverture", "INTEGER")):
+        if nom not in colonnes("voyage"):
+            db.execute(f"ALTER TABLE voyage ADD COLUMN {nom} {typ}")
+    db.commit()
+
+
 def connect():
     db = sqlite3.connect(DB_PATH, factory=Base, check_same_thread=False)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    migrer(db)
     try:
         db.executescript(FTS)
         db.has_fts = True
@@ -93,8 +107,8 @@ def connect():
 
 
 def montant(s):
-    """Accepte 12.5 et 12,5."""
-    return float(s.replace(",", "."))
+    """Accepte 12.5, 12,5, « 1 500,50 » et « 12 € »."""
+    return float(re.sub(r"\s+", "", s).replace(",", ".").replace("€", ""))
 
 
 def iso(s):
@@ -118,6 +132,8 @@ def fmt_note(n):
         ligne += f" · {n['lieu']}"
     if humeur:
         ligne += f" · {humeur}"
+    if n["favori"]:
+        ligne += " · ⭐ moment fort"
     if n["depense"]:
         ligne += f" · {n['depense']:.2f} €"
     if n["tags"]:
@@ -131,10 +147,11 @@ def cmd_voyage(db, a):
     fin = iso(a.fin) if a.fin else None
     with db:
         db.execute(
-            "INSERT INTO voyage(nom,pays,debut,fin) VALUES(?,?,?,?) "
+            "INSERT INTO voyage(nom,pays,debut,fin,budget) VALUES(?,?,?,?,?) "
             "ON CONFLICT(nom) DO UPDATE SET pays=COALESCE(excluded.pays,pays), "
-            "debut=COALESCE(excluded.debut,debut), fin=COALESCE(excluded.fin,fin)",
-            (a.nom, a.pays, debut, fin),
+            "debut=COALESCE(excluded.debut,debut), fin=COALESCE(excluded.fin,fin), "
+            "budget=COALESCE(excluded.budget,budget)",
+            (a.nom, a.pays, debut, fin, a.budget),
         )
     print(f"Voyage « {a.nom} » enregistré.")
 
@@ -155,9 +172,9 @@ def cmd_note(db, a):
     vid = voyage_id(db, a.voyage)
     with db:
         cur = db.execute(
-            "INSERT INTO note(voyage_id,jour,lieu,texte,humeur,depense,tags) VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO note(voyage_id,jour,lieu,texte,humeur,depense,tags,favori) VALUES(?,?,?,?,?,?,?,?)",
             (vid, iso(a.jour) if a.jour else date.today().isoformat(), a.lieu,
-             a.texte, a.humeur, a.depense, a.tags),
+             a.texte, a.humeur, a.depense, a.tags, 1 if a.favori else 0),
         )
     print(f"Note #{cur.lastrowid} ajoutée.")
 
@@ -228,7 +245,7 @@ def cmd_suppr(db, a):
 
 def exporter(db, nom, vid, fmt="md", images=None):
     rows = [dict(r) for r in db.execute(
-        "SELECT jour,lieu,texte,humeur,depense,tags FROM note WHERE voyage_id=? ORDER BY jour,id", (vid,))]
+        "SELECT jour,lieu,texte,humeur,depense,tags,favori FROM note WHERE voyage_id=? ORDER BY jour,id", (vid,))]
     if fmt == "json":
         return json.dumps({"voyage": nom, "notes": rows}, ensure_ascii=False, indent=2)
     par_jour = defaultdict(list)
@@ -242,11 +259,29 @@ def exporter(db, nom, vid, fmt="md", images=None):
         for chemin in (images or {}).get(jour, []):
             parts.append(f"![Photo du {jour}]({chemin})\n")
         for r in notes:
-            lieu = f"**{r['lieu']}** — " if r["lieu"] else ""
+            lieu = ("⭐ " if r["favori"] else "") + (f"**{r['lieu']}** — " if r["lieu"] else "")
             extra = f" _({r['depense']:.2f} €)_" if r["depense"] else ""
             parts.append(f"- {lieu}{r['texte']}{extra}")
         parts.append("")
     return "\n".join(parts)
+
+
+def sauvegarde_octets(db):
+    """Copie cohérente de toute la base (notes, photos, réglages) via l'API de sauvegarde de SQLite."""
+    with tempfile.TemporaryDirectory() as tmp:
+        chemin = Path(tmp) / "carnet.db"
+        dest = sqlite3.connect(chemin)
+        try:
+            db.backup(dest)
+        finally:
+            dest.close()
+        return chemin.read_bytes()
+
+
+def cmd_sauvegarde(db, a):
+    chemin = Path(a.sortie or f"carnet-sauvegarde-{date.today().isoformat()}.db")
+    chemin.write_bytes(sauvegarde_octets(db))
+    print(f"Sauvegarde enregistrée : {chemin}")
 
 
 def cmd_export(db, a):
@@ -264,6 +299,7 @@ def build_parser():
 
     s = sub.add_parser("voyage", help="créer / mettre à jour un voyage")
     s.add_argument("nom"); s.add_argument("--pays"); s.add_argument("--debut"); s.add_argument("--fin")
+    s.add_argument("--budget", type=montant, help="budget total en euros")
     s.set_defaults(fn=cmd_voyage)
 
     sub.add_parser("voyages", help="lister les voyages").set_defaults(fn=cmd_voyages)
@@ -274,6 +310,7 @@ def build_parser():
     s.add_argument("--humeur", type=int, choices=range(1, 6))
     s.add_argument("--depense", type=montant, default=0.0)
     s.add_argument("--tags", help="séparés par des virgules")
+    s.add_argument("--favori", action="store_true", help="marquer comme moment fort")
     s.set_defaults(fn=cmd_note)
 
     s = sub.add_parser("lire", help="lire les notes d'un voyage")
@@ -293,6 +330,10 @@ def build_parser():
     s = sub.add_parser("export", help="exporter en Markdown ou JSON")
     s.add_argument("voyage"); s.add_argument("--format", choices=["md", "json"], default="md")
     s.add_argument("-o", "--sortie"); s.set_defaults(fn=cmd_export)
+
+    s = sub.add_parser("sauvegarde", help="copie complète du carnet (notes, photos, réglages)")
+    s.add_argument("-o", "--sortie", help="fichier .db à créer (défaut : carnet-sauvegarde-AAAA-MM-JJ.db)")
+    s.set_defaults(fn=cmd_sauvegarde)
 
     s = sub.add_parser("web", help="version web locale (navigateur)")
     s.add_argument("--port", type=int, default=8000)
@@ -481,10 +522,61 @@ kbd{border:1px solid var(--line);border-radius:5px;padding:0 6px;font:12px var(-
 .lbx,.lbn{position:absolute;border:0;background:rgba(255,255,255,.12);color:#fff;border-radius:999px;width:46px;height:46px;display:grid;place-items:center}
 .lbx{top:18px;right:18px}.lbn{top:50%;transform:translateY(-50%)}.lbn.prev{left:18px}.lbn.next{right:18px}
 .lbx:hover,.lbn:hover{background:rgba(255,255,255,.25)}
+.favbtn{border:0;background:none;padding:2px 5px;font-size:21px;line-height:1;color:var(--muted);opacity:0;transition:opacity .15s,color .15s,transform .15s;border-radius:6px}
+.entry:hover .favbtn,.favbtn:focus-visible{opacity:.75}
+.favbtn:hover{color:var(--gold);opacity:1;transform:scale(1.12)}
+.favbtn[aria-pressed="true"]{opacity:1;color:var(--gold)}
+@media (hover:none){.favbtn{opacity:.6}.favbtn[aria-pressed="true"]{opacity:1}}
+.cfields .favbtn{opacity:1;font-size:24px}
+.stub .starday{color:var(--gold);font-size:18px;margin-left:6px;vertical-align:.25em}
+.btn[aria-pressed="true"]{background:var(--sky);border-color:var(--blue)}
+.hero .budget{position:relative;margin-top:18px;max-width:540px}
+.bbar{height:8px;border-radius:5px;background:rgba(255,255,255,.22);overflow:hidden}
+.bbar i{display:block;height:100%;background:#fff;border-radius:5px}
+.budget.over .bbar i{background:#ff7b8a}
+.hero .budget p{margin:8px 0 0;font-size:15px}
+.hero.has-cover{background:linear-gradient(180deg,rgba(14,26,64,.55) 0%,rgba(14,26,64,.92) 100%),var(--cover) center/cover no-repeat}
+.hero.has-cover .globe{opacity:.07}
+.stamp.photo{background-size:cover;background-position:center;color:transparent}
+.ph .pcover{position:absolute;top:6px;left:6px;width:28px;height:28px;border:0;border-radius:999px;background:rgba(10,16,32,.72);color:#fff;display:grid;place-items:center;opacity:0;transition:opacity .15s}
+.ph:hover .pcover,.ph:focus-within .pcover{opacity:1}
+.ph .pcover:hover{background:var(--blue)}
+.ph .badge{position:absolute;left:6px;bottom:6px;background:rgba(10,16,32,.8);color:#fff;font-size:12px;padding:2px 8px;border-radius:999px;pointer-events:none}
+@media (hover:none){.ph .pcover{opacity:1}}
+.frise{margin:8px 0 0}
+.frise h3{font:600 18px var(--display);margin:0 0 10px}
+.fgrid{display:flex;flex-wrap:wrap;gap:6px}
+.fm{flex-basis:100%;font-size:13px;color:var(--muted);margin:6px 0 0;text-transform:capitalize}
+.fday{position:relative;width:32px;height:32px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--muted);font-size:13px;font-variant-numeric:tabular-nums;display:grid;place-items:center;padding:0}
+.fday:hover{border-color:var(--blue);color:var(--ink)}
+.fday.has{background:var(--blue);border-color:var(--blue);color:var(--blue-ink);font-weight:600}
+.fday.hasph::after{content:"";position:absolute;right:3px;bottom:3px;width:6px;height:6px;border-radius:50%;background:var(--red)}
+.fday.hasfav{box-shadow:0 0 0 2px var(--gold)}
+.fday.today{outline:2px dotted var(--ink);outline-offset:2px}
+.flegend{margin:10px 0 0;font-size:13px;color:var(--muted)}
+.ticket.flash{animation:flash 1.4s}
+@keyframes flash{0%{box-shadow:0 0 0 4px var(--blue)}100%{box-shadow:0 0 0 4px transparent}}
+.sidefoot .wide{flex:1 1 100%}
+:root{--gold:#d99a00}
+:root[data-theme="dark"]{--gold:#f2c14e}
+@media (prefers-color-scheme:dark){:root[data-theme="auto"]{--gold:#f2c14e}}
+@media print{
+  :root,:root[data-theme="dark"],:root[data-theme="auto"],:root[data-theme="light"]{--bg:#fff;--surface:#fff;--raised:#f6f6f6;--ink:#111;--muted:#555;--line:#cfcfcf;--blue:#2447b5;--blue-ink:#fff;--sky:#eef2fb;--gold:#b97a00}
+  @page{margin:14mm}
+  html,body{height:auto;background:#fff}
+  .app{display:block;height:auto}
+  .side,.tools,.composer,.hero .acts,.eact,.padd,.pbar,.pdel,.pcover,.ph .badge,.favbtn:not([aria-pressed="true"]),.frise,#toasts,.scrim,.lb{display:none!important}
+  .main{overflow:visible}
+  .wrap{max-width:none;padding:0}
+  .hero,.airmail,.bbar,.bbar i,.meter i,.bar,.fday,.stamp{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .hero{border-radius:0}.airmail{border-radius:0}
+  .ticket{break-inside:avoid;margin:14px 0}
+  .insights{break-inside:avoid}
+}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 @keyframes pop{from{opacity:0;transform:translateY(6px) scale(.98)}to{opacity:1;transform:none}}
 
-@media (max-width:860px){
+@media screen and (max-width:860px){
   .app{grid-template-columns:minmax(0,1fr);height:auto;min-height:100vh}
   .side{min-width:0}
   .side{border-right:0;border-bottom:1px solid var(--line)}
@@ -512,6 +604,7 @@ kbd{border:1px solid var(--line);border-radius:5px;padding:0 6px;font:12px var(-
     <button class="btn primary new" data-act="new-voyage" id="b-new"></button>
     <nav class="trips" id="trips" aria-label="Voyages"></nav>
     <div class="sidefoot">
+      <a class="btn wide" href="/api/sauvegarde" download id="b-save" title="Télécharge une copie complète de ton carnet (notes, photos, réglages)"></a>
       <button class="btn" data-act="theme" id="b-theme"></button>
       <button class="btn" data-act="quit" id="b-quit"></button>
     </div>
@@ -542,13 +635,16 @@ const PATHS={
   image:'<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="M21 16l-5-5-8 8"/>',
   close:'<path d="M6 6l12 12M18 6L6 18"/>',
   left:'<path d="M15 5l-7 7 7 7"/>',
-  right:'<path d="M9 5l7 7-7 7"/>'
+  right:'<path d="M9 5l7 7-7 7"/>',
+  flag:'<path d="M5 21V4"/><path d="M5 4h12l-2 4 2 4H5"/>',
+  print:'<path d="M6 9V3h12v6"/><rect x="4" y="9" width="16" height="9" rx="2"/><path d="M7 14h10v7H7z"/>',
+  disk:'<path d="M5 3h11l4 4v14H5z"/><path d="M8 3v6h8V3"/><rect x="8" y="14" width="8" height="7"/>'
 };
 const ic=(n,s=18)=>`<svg viewBox="0 0 24 24" width="${s}" height="${s}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${PATHS[n]}</svg>`;
 const GLOBE='<svg class="globe" viewBox="0 0 200 200" fill="none" stroke="#fff" stroke-width="1.2" aria-hidden="true"><circle cx="100" cy="100" r="90"/><ellipse cx="100" cy="100" rx="40" ry="90"/><ellipse cx="100" cy="100" rx="75" ry="90"/><path d="M10 100h180M20 60h160M20 140h160"/></svg>';
 const COMPASS='<svg viewBox="0 0 40 40" width="84" height="84" aria-hidden="true"><rect width="40" height="40" rx="9" style="fill:var(--hero)"/><circle cx="20" cy="20" r="11" fill="none" stroke="#fff" stroke-width="2"/><path d="M20 10l4.5 10-4.5 10-4.5-10z" fill="#d62839"/></svg>';
 
-const S={voyages:[],vid:null,d:null,q:'',edit:null,theme:'auto',desc:false,mood:null};
+const S={voyages:[],vid:null,d:null,q:'',edit:null,theme:'auto',desc:false,mood:null,fav:false,favOnly:false};
 const THEMES=['auto','clair','sombre'];
 const THEMELBL={auto:'Thème auto',clair:'Thème clair',sombre:'Thème sombre'};
 
@@ -591,7 +687,7 @@ function applyTheme(){
 /* ---------- barre latérale ---------- */
 function renderSide(){
   $('#trips').innerHTML=S.voyages.map(v=>`<button class="trip" data-vid="${v.id}" aria-current="${v.id===S.vid}">
-    <span class="stamp" style="--h:${hue(v.nom)}">${esc(initials(v.nom))}</span>
+    <span class="stamp${v.couverture?' photo':''}" style="--h:${hue(v.nom)}${v.couverture?`;background-image:url(/api/photo/${v.couverture}?v=mini)`:''}">${v.couverture?'':esc(initials(v.nom))}</span>
     <span class="tt"><span class="tn">${esc(v.nom)}</span><span class="ts">${esc(v.pays||'Sans pays')}</span><span class="ts">${pl(v.nb,'note')}${v.total?', '+EUR.format(v.total):''}</span></span></button>`).join('')
     ||'<p class="ts" style="padding:8px 12px;white-space:normal">Aucun voyage pour l’instant.</p>';
 }
@@ -603,8 +699,28 @@ function heroActs(){
     <a class="btn ghost" href="/api/voyage/${v.id}/export?format=md" download>${ic('down',16)}Exporter en Markdown</a>
     ${S.d.photos.length?`<a class="btn ghost" href="/api/voyage/${v.id}/export?format=zip" download>${ic('down',16)}Exporter avec les photos</a>`:''}
     <a class="btn ghost" href="/api/voyage/${v.id}/export?format=json" download>${ic('down',16)}Exporter en JSON</a>
+    <button class="btn ghost" data-act="print">${ic('print',16)}Imprimer / PDF</button>
     <button class="btn ghost" data-act="del-voyage">${ic('trash',16)}Supprimer le voyage</button>`;
 }
+function budgetHtml(){
+  const v=S.d.voyage,s=S.d.stats;
+  if(v.budget==null)return '';
+  const pct=v.budget>0?s.total/v.budget:0,over=s.total>v.budget,jours=s.par_jour.length;
+  const reste=over?`dépassé de ${EUR.format(s.total-v.budget)}`:`il reste ${EUR.format(v.budget-s.total)}`;
+  return `<div class="budget${over?' over':''}"><div class="bbar" role="progressbar" aria-label="Budget utilisé" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.min(100,Math.round(pct*100))}"><i style="width:${Math.min(100,pct*100).toFixed(1)}%"></i></div><p>${EUR.format(s.total)} dépensés sur ${EUR.format(v.budget)} (${Math.round(pct*100)} %), ${reste}.${jours&&s.total?` Moyenne : ${EUR.format(s.total/jours)} par jour noté.`:''}</p></div>`;
+}
+function heroHtml(){
+  const v=S.d.voyage;
+  return `<div class="hero${v.couverture?' has-cover':''}"${v.couverture?` style="--cover:url(/api/photo/${v.couverture})"`:''}>${GLOBE}
+    <h2>${esc(v.nom)}</h2>
+    <div class="where">${esc(where(v))}</div>
+    <p class="sum" id="sum">${esc(summary())}</p>
+    ${budgetHtml()}
+    <div class="acts" id="acts">${heroActs()}</div>
+  </div>
+  <div class="airmail"></div>`;
+}
+function renderHero(){const h=$('#hero');if(h)h.innerHTML=heroHtml()}
 function renderMain(){
   const m=$('#main');
   if(!S.voyages.length||!S.d){
@@ -614,16 +730,9 @@ function renderMain(){
   const v=S.d.voyage;
   document.title=v.nom+' – Carnet';
   m.innerHTML=`<div class="wrap">
-  <header>
-    <div class="hero">${GLOBE}
-      <h2>${esc(v.nom)}</h2>
-      <div class="where">${esc(where(v))}</div>
-      <p class="sum" id="sum"></p>
-      <div class="acts" id="acts">${heroActs()}</div>
-    </div>
-    <div class="airmail"></div>
-  </header>
+  <header id="hero">${heroHtml()}</header>
   <section class="insights" id="insights"></section>
+  <section class="frise" id="frise"></section>
   <form class="composer" id="composer" autocomplete="off">
     <div class="ebanner" id="ebanner" hidden><span>Modification d’une note</span><button type="button" class="linkbtn" data-act="cancel-edit">Annuler</button></div>
     <textarea id="f-texte" rows="2" placeholder="Qu’est-ce qui s’est passé aujourd’hui ?" required></textarea>
@@ -631,6 +740,7 @@ function renderMain(){
       <label class="field"><span class="sr">Jour</span><input type="date" id="f-jour" required></label>
       <label class="field grow"><span class="sr">Lieu</span><input id="f-lieu" list="lieux" placeholder="Lieu" maxlength="120"><datalist id="lieux"></datalist></label>
       <div class="moods" id="f-moods" role="group" aria-label="Humeur">${[1,2,3,4,5].map(i=>`<button type="button" data-mood="${i}" aria-pressed="false" title="${MOODTXT[i]}" aria-label="${MOODTXT[i]}">${MOODS[i]}</button>`).join('')}</div>
+      <button type="button" class="favbtn" id="f-fav" data-act="composer-fav" aria-pressed="false" aria-label="Moment fort" title="Marquer comme moment fort">☆</button>
       <label class="field w90"><span class="sr">Dépense en euros</span><input id="f-dep" inputmode="decimal" placeholder="Dépense €"></label>
       <label class="field grow"><span class="sr">Tags</span><input id="f-tags" placeholder="Tags : food, temple"></label>
       <button type="button" class="btn" data-act="photo-composer" title="Ajouter des photos à la date choisie">${ic('image',16)}Photos</button>
@@ -639,19 +749,21 @@ function renderMain(){
   </form>
   <div class="tools">
     <label class="search">${ic('search',18)}<span class="sr">Rechercher</span><input id="q" type="search" placeholder="Rechercher dans ce voyage" value="${esc(S.q)}"><kbd>/</kbd></label>
+    <button class="btn" data-act="fav-filter" id="b-fav" aria-pressed="false"></button>
     <button class="btn" data-act="order" id="b-order">${ic('sort',16)}<span></span></button>
   </div>
   <section id="timeline"></section>
   </div>`;
-  renderInsights();renderTimeline();updateLieux();setComposer(null);paintOrder();
+  renderInsights();renderFrise();renderTimeline();updateLieux();setComposer(null);paintTools();
 }
 
 function summary(){
-  const s=S.d.stats,ph=S.d.photos.length;
+  const s=S.d.stats,ph=S.d.photos.length,avecBudget=S.d.voyage.budget!=null;
   if(!s.nb)return ph?`Aucune note pour l’instant, ${pl(ph,'photo')}.`:'Ce carnet est encore vide.';
   let t=`${pl(s.nb,'note')} écrite${s.nb>1?'s':''}`+(s.lieux?` dans ${pl(s.lieux,'lieu','lieux')}`:'')+'.';
-  if(s.total)t+=` ${EUR.format(s.total)} dépensés`+(s.humeur?`, humeur moyenne de ${NUM1.format(s.humeur)} sur 5.`:'.');
+  if(s.total&&!avecBudget)t+=` ${EUR.format(s.total)} dépensés`+(s.humeur?`, humeur moyenne de ${NUM1.format(s.humeur)} sur 5.`:'.');
   else if(s.humeur)t+=` Humeur moyenne de ${NUM1.format(s.humeur)} sur 5.`;
+  if(s.favoris)t+=` ${pl(s.favoris,'moment fort','moments forts')}.`;
   if(ph)t+=` ${pl(ph,'photo')}.`;
   return t;
 }
@@ -667,13 +779,41 @@ function chart(pj){
   return s+`<text class="axis" x="4" y="12">${EUR.format(max)}</text></svg>`;
 }
 function renderInsights(){
-  $('#sum').textContent=summary();
   const s=S.d.stats,el=$('#insights');
   if(!s.nb){el.hidden=true;return}
   el.hidden=false;
   const max=Math.max(...s.top_lieux.map(l=>l.nb),1);
   el.innerHTML=`<div><h3>Dépenses par jour</h3>${chart(s.par_jour)}</div>`+
     (s.top_lieux.length?`<div><h3>Lieux les plus visités</h3><ul class="lieux">${s.top_lieux.map(l=>`<li><button class="linkbtn" data-q="${esc(l.lieu)}">${esc(l.lieu)}</button><span class="ts">${pl(l.nb,'note')}</span><div class="meter"><i style="width:${(l.nb/max*100).toFixed(0)}%"></i></div></li>`).join('')}</ul></div>`:'');
+}
+function dateParDefaut(){
+  const v=S.d&&S.d.voyage,t=today();
+  if(!v)return t;
+  if(v.debut&&t<v.debut)return v.debut;
+  if(v.fin&&t>v.fin)return v.fin;
+  return t;
+}
+function renderFrise(){
+  const el=$('#frise');if(!el)return;
+  const v=S.d.voyage,info={};
+  S.d.stats.par_jour.forEach(d=>{info[d.jour]={nb:d.nb,fav:d.favoris,ph:0}});
+  S.d.photos.forEach(p=>{(info[p.jour]??={nb:0,fav:0,ph:0}).ph++});
+  const jours=Object.keys(info).sort();
+  let a=v.debut||jours[0],b=v.fin||jours[jours.length-1];
+  if(!a||!b){el.hidden=true;return}
+  if(jours.length){if(jours[0]<a)a=jours[0];if(jours[jours.length-1]>b)b=jours[jours.length-1]}
+  const n=Math.round((D(b)-D(a))/864e5)+1;
+  if(n<1||n>120){el.hidden=true;return}
+  el.hidden=false;
+  let html='',mois='';const t=today();
+  for(let i=0;i<n;i++){
+    const d=new Date(D(a).getTime()+i*864e5),j=d.toLocaleDateString('sv-SE'),m=d.toLocaleDateString('fr-FR',{month:'long',year:'numeric'});
+    if(m!==mois){mois=m;html+=`<span class="fm">${esc(m)}</span>`}
+    const x=info[j]||{nb:0,fav:0,ph:0};
+    const tip=`${fCourt(j)} : ${x.nb?pl(x.nb,'note'):'aucune note'}${x.ph?', '+pl(x.ph,'photo'):''}${x.fav?', moment fort':''}`;
+    html+=`<button class="fday${x.nb?' has':''}${x.ph?' hasph':''}${x.fav?' hasfav':''}${j===t?' today':''}" data-act="goto-day" data-day="${j}" title="${esc(tip)}" aria-label="${esc(tip)}">${d.getDate()}</button>`;
+  }
+  el.innerHTML=`<h3>Les jours du voyage</h3><div class="fgrid">${html}</div><p class="flegend">Un jour plein a une note. Un point rouge indique des photos, un contour doré un moment fort. Un clic ouvre le jour ou prépare la saisie.</p>`;
 }
 function updateLieux(){$('#lieux').innerHTML=S.d.lieux.map(l=>`<option value="${esc(l)}">`).join('')}
 
@@ -682,6 +822,7 @@ const photosDe=j=>S.d.photos.filter(p=>p.jour===j);
 function entryHtml(n){
   return `<div class="entry" data-id="${n.id}">
     <div class="ehead">${n.lieu?`<span class="eplace">${esc(n.lieu)}</span>`:''}${n.humeur?`<span class="emood" title="${MOODTXT[n.humeur]}">${MOODS[n.humeur]}</span>`:''}
+      <button class="favbtn" data-act="fav" aria-pressed="${n.favori?'true':'false'}" aria-label="${n.favori?'Retirer des moments forts':'Marquer comme moment fort'}" title="Moment fort">${n.favori?'★':'☆'}</button>
       <span class="ecost">${n.depense?EUR.format(n.depense):''}</span>
       <span class="eact"><button class="iconbtn" data-act="edit" aria-label="Modifier la note">${ic('edit')}</button><button class="iconbtn" data-act="del" aria-label="Supprimer la note">${ic('trash')}</button></span></div>
     <p class="etext">${esc(n.texte)}</p>
@@ -689,49 +830,56 @@ function entryHtml(n){
   </div>`;
 }
 function photoBlock(j){
-  const ps=photosDe(j);
+  const ps=photosDe(j),cov=S.d.voyage.couverture;
   if(!ps.length)return `<div class="photos"><button class="pbar" data-act="photo-add">${ic('image',18)}Ajouter des photos (${MAXP} maximum par jour)</button></div>`;
-  return `<div class="photos"><div class="pgrid">${ps.map((p,i)=>`<div class="ph"><button class="open" data-act="photo-open" data-pid="${p.id}" aria-label="Agrandir la photo ${i+1}"><img src="/api/photo/${p.id}?v=mini" alt="Photo ${i+1} du ${esc(fCourt(j))}" loading="lazy" decoding="async"></button><button class="pdel" data-act="photo-del" data-pid="${p.id}" aria-label="Supprimer la photo ${i+1}">${ic('close',16)}</button></div>`).join('')}${ps.length<MAXP?`<button class="padd" data-act="photo-add">${ic('image',20)}<span>Ajouter une photo</span><span class="ts">${ps.length} sur ${MAXP}</span></button>`:''}</div></div>`;
+  return `<div class="photos"><div class="pgrid">${ps.map((p,i)=>`<div class="ph"><button class="open" data-act="photo-open" data-pid="${p.id}" aria-label="Agrandir la photo ${i+1}"><img src="/api/photo/${p.id}?v=mini" alt="Photo ${i+1} du ${esc(fCourt(j))}" loading="lazy" decoding="async"></button><button class="pcover" data-act="photo-cover" data-pid="${p.id}" aria-label="${p.id===cov?'Retirer la couverture':'Utiliser comme couverture'}" title="${p.id===cov?'Retirer la couverture':'Utiliser comme couverture'}">${ic('flag',16)}</button>${p.id===cov?'<span class="badge">Couverture</span>':''}<button class="pdel" data-act="photo-del" data-pid="${p.id}" aria-label="Supprimer la photo ${i+1}">${ic('close',16)}</button></div>`).join('')}${ps.length<MAXP?`<button class="padd" data-act="photo-add">${ic('image',20)}<span>Ajouter une photo</span><span class="ts">${ps.length} sur ${MAXP}</span></button>`:''}</div></div>`;
 }
 function ticket(j,ns){
   const tot=ns.reduce((a,n)=>a+n.depense,0),lieux=[...new Set(ns.map(n=>n.lieu).filter(Boolean))];
   const dt=D(j);
   return `<article class="ticket" data-jour="${j}"><div class="stub"><span class="notch t"></span><span class="notch b"></span>
     <div class="wd">${dt.toLocaleDateString('fr-FR',{weekday:'long'})}</div>
-    <span class="dn">${dt.getDate()}</span>
+    <span class="dn">${dt.getDate()}${ns.some(n=>n.favori)?'<span class="starday" title="Moment fort">★</span>':''}</span>
     <div class="my">${dt.toLocaleDateString('fr-FR',{month:'long',year:'numeric'})}</div>
     ${tot?`<div class="tot">${EUR.format(tot)}</div>`:''}
     ${lieux.length?`<div class="pl">${esc(lieux.slice(0,3).join(', '))}</div>`:''}
   </div><div class="entries">${ns.length?ns.map(entryHtml).join(''):'<p class="nonote">Aucune note ce jour-là.</p>'}${photoBlock(j)}</div></article>`;
 }
 function renderTimeline(){
-  const el=$('#timeline'),notes=S.d.notes,g={};
+  const el=$('#timeline'),g={};
+  const notes=S.favOnly?S.d.notes.filter(n=>n.favori):S.d.notes;
   notes.forEach(n=>(g[n.jour]??=[]).push(n));
-  if(!S.q)S.d.photos.forEach(p=>{g[p.jour]??=[]});
+  if(!S.q&&!S.favOnly)S.d.photos.forEach(p=>{g[p.jour]??=[]});
   const jours=Object.keys(g).sort();if(S.desc)jours.reverse();
   if(!jours.length){
-    el.innerHTML=S.q?`<p class="none">Aucun résultat pour « ${esc(S.q)} ».</p>`:'<p class="none">Aucune note pour l’instant. Écris la première ci-dessus.</p>';
+    el.innerHTML=S.q?`<p class="none">Aucun résultat pour « ${esc(S.q)} ».</p>`:S.favOnly?'<p class="none">Aucun moment fort pour l’instant. Clique sur l’étoile d’une note pour la garder ici.</p>':'<p class="none">Aucune note pour l’instant. Écris la première ci-dessus.</p>';
     return;
   }
-  el.innerHTML=(S.q?`<p class="count">${pl(notes.length,'résultat')} pour « ${esc(S.q)} »</p>`:'')+jours.map(j=>ticket(j,g[j])).join('');
+  const entete=S.q?`<p class="count">${pl(notes.length,'résultat')} pour « ${esc(S.q)} »</p>`:S.favOnly?`<p class="count">${pl(notes.length,'moment fort','moments forts')}</p>`:'';
+  el.innerHTML=entete+jours.map(j=>ticket(j,g[j])).join('');
 }
-function paintOrder(){const b=$('#b-order span');if(b)b.textContent=S.desc?'Plus récent d’abord':'Plus ancien d’abord'}
+function paintTools(){
+  const b=$('#b-order span');if(b)b.textContent=S.desc?'Plus récent d’abord':'Plus ancien d’abord';
+  const f=$('#b-fav');
+  if(f){const n=S.d?S.d.stats.favoris:0;f.setAttribute('aria-pressed',String(S.favOnly));f.innerHTML=`<span aria-hidden="true">${S.favOnly?'★':'☆'}</span> Moments forts${n?` (${n})`:''}`}
+}
 
 /* ---------- saisie ---------- */
 function paintMood(){document.querySelectorAll('#f-moods button').forEach(b=>b.setAttribute('aria-pressed',String(+b.dataset.mood===S.mood)))}
+function paintFav(){const b=$('#f-fav');if(b){b.setAttribute('aria-pressed',String(S.fav));b.textContent=S.fav?'★':'☆'}}
 function autosize(){const t=$('#f-texte');if(!t)return;t.style.height='auto';t.style.height=Math.max(54,t.scrollHeight)+'px'}
 function setComposer(n){
   S.edit=n||null;
   $('#ebanner').hidden=!n;
   $('#f-submit').textContent=n?'Enregistrer':'Ajouter la note';
   if(n){
-    $('#f-texte').value=n.texte;$('#f-jour').value=n.jour;$('#f-lieu').value=n.lieu||'';S.mood=n.humeur;
+    $('#f-texte').value=n.texte;$('#f-jour').value=n.jour;$('#f-lieu').value=n.lieu||'';S.mood=n.humeur;S.fav=!!n.favori;
     $('#f-dep').value=n.depense?String(n.depense).replace('.',','):'';$('#f-tags').value=n.tags?n.tags.split(',').join(', '):'';
   }else{
-    $('#f-texte').value='';$('#f-dep').value='';$('#f-tags').value='';S.mood=null;
-    if(!$('#f-jour').value)$('#f-jour').value=today();
+    $('#f-texte').value='';$('#f-dep').value='';$('#f-tags').value='';S.mood=null;S.fav=false;
+    if(!$('#f-jour').value)$('#f-jour').value=dateParDefaut();
   }
-  paintMood();autosize();
+  paintMood();paintFav();autosize();
 }
 
 /* ---------- données ---------- */
@@ -739,8 +887,7 @@ const enc=encodeURIComponent;
 async function refresh(){
   const [d,v]=await Promise.all([api('GET',`voyage/${S.vid}?q=${enc(S.q)}`),api('GET','voyages')]);
   S.d=d;S.voyages=v.voyages;
-  renderSide();renderInsights();renderTimeline();updateLieux();
-  const acts=$('#acts');if(acts)acts.innerHTML=heroActs();
+  renderSide();renderHero();renderInsights();renderFrise();renderTimeline();updateLieux();paintTools();
 }
 async function select(vid){
   S.vid=vid;S.q='';S.edit=null;
@@ -823,6 +970,7 @@ function voyageDialog(v){
     <label for="d-pays">Pays</label><input id="d-pays" name="pays" maxlength="80" value="${esc(v?.pays)}">
     <div class="dgrid"><div><label for="d-debut">Début</label><input id="d-debut" type="date" name="debut" value="${esc(v?.debut)}"></div>
     <div><label for="d-fin">Fin</label><input id="d-fin" type="date" name="fin" value="${esc(v?.fin)}"></div></div>
+    <label for="d-budget">Budget en euros (facultatif)</label><input id="d-budget" name="budget" inputmode="decimal" placeholder="2 000" value="${v&&v.budget!=null?esc(String(v.budget).replace('.',',')):''}">
     <div class="dactions"><button type="button" class="btn" data-close>Annuler</button><button class="btn primary">${v?'Enregistrer':'Créer le voyage'}</button></div>`,
   async(f,close)=>{
     if(v){await api('PUT','voyage/'+v.id,f);close();await reloadVoyages();S.d=await api('GET','voyage/'+v.id);renderSide();renderMain();toast('Voyage enregistré.')}
@@ -854,17 +1002,33 @@ document.addEventListener('click',async e=>{
       case 'del-voyage':deleteVoyageDialog();break;
       case 'cancel-edit':setComposer(null);break;
       case 'photo-add':S.fileJour=t.closest('.ticket').dataset.jour;$('#file').click();break;
-      case 'photo-composer':S.fileJour=$('#f-jour').value||today();$('#file').click();break;
+      case 'photo-composer':S.fileJour=$('#f-jour').value||dateParDefaut();$('#file').click();break;
       case 'photo-open':lightbox(+t.dataset.pid);break;
       case 'photo-del':photoDelDialog(+t.dataset.pid);break;
+      case 'photo-cover':{
+        const pid=+t.dataset.pid,deja=S.d.voyage.couverture===pid;
+        await api('PUT',`voyage/${S.vid}/couverture`,{photo_id:deja?null:pid});await refresh();
+        toast(deja?'Couverture retirée.':'Couverture définie.');break}
+      case 'fav':{
+        const n=S.d.notes.find(x=>x.id===id);if(!n)break;
+        await api('PUT',`note/${id}/favori`,{favori:!n.favori});await refresh();
+        toast(n.favori?'Retiré des moments forts.':'Ajouté aux moments forts.');break}
+      case 'composer-fav':S.fav=!S.fav;paintFav();break;
+      case 'fav-filter':S.favOnly=!S.favOnly;paintTools();renderTimeline();break;
+      case 'print':window.print();break;
+      case 'goto-day':{
+        const j=t.dataset.day,tk=document.querySelector(`.ticket[data-jour="${j}"]`);
+        if(tk){tk.scrollIntoView({behavior:'smooth',block:'start'});tk.classList.remove('flash');void tk.offsetWidth;tk.classList.add('flash')}
+        else{$('#f-jour').value=j;$('#composer').scrollIntoView({behavior:'smooth',block:'center'});$('#f-texte').focus();toast(`Date réglée au ${fCourt(j)}.`)}
+        break}
       case 'edit':{const n=S.d.notes.find(x=>x.id===id);if(n){setComposer(n);$('#composer').scrollIntoView({behavior:'smooth',block:'center'});$('#f-texte').focus()}break}
       case 'del':{
         const n=S.d.notes.find(x=>x.id===id);if(!n)break;
         await api('DELETE','note/'+id);await refresh();
         toast('Note supprimée.','Annuler',async()=>{
-          try{await api('POST','note',{voyage_id:S.vid,jour:n.jour,lieu:n.lieu,texte:n.texte,humeur:n.humeur,depense:n.depense,tags:n.tags});await refresh();toast('Note rétablie.')}catch(err){fail(err)}
+          try{await api('POST','note',{voyage_id:S.vid,jour:n.jour,lieu:n.lieu,texte:n.texte,humeur:n.humeur,depense:n.depense,tags:n.tags,favori:n.favori});await refresh();toast('Note rétablie.')}catch(err){fail(err)}
         });break}
-      case 'order':S.desc=!S.desc;paintOrder();renderTimeline();api('PUT','reglage',{cle:'ordre',valeur:S.desc?'desc':'asc'}).catch(()=>{});break;
+      case 'order':S.desc=!S.desc;paintTools();renderTimeline();api('PUT','reglage',{cle:'ordre',valeur:S.desc?'desc':'asc'}).catch(()=>{});break;
       case 'theme':S.theme=THEMES[(THEMES.indexOf(S.theme)+1)%3];applyTheme();api('PUT','reglage',{cle:'theme',valeur:S.theme}).catch(()=>{});break;
       case 'quit':
         await api('POST','quit');
@@ -885,7 +1049,7 @@ document.addEventListener('input',e=>{
 document.addEventListener('submit',async e=>{
   if(e.target.id!=='composer')return;
   e.preventDefault();
-  const body={texte:$('#f-texte').value,jour:$('#f-jour').value,lieu:$('#f-lieu').value,humeur:S.mood,depense:$('#f-dep').value,tags:$('#f-tags').value};
+  const body={texte:$('#f-texte').value,jour:$('#f-jour').value,lieu:$('#f-lieu').value,humeur:S.mood,depense:$('#f-dep').value,tags:$('#f-tags').value,favori:S.fav};
   try{
     if(S.edit){await api('PUT','note/'+S.edit.id,body);toast('Note enregistrée.')}
     else{body.voyage_id=S.vid;await api('POST','note',body);toast('Note ajoutée.')}
@@ -899,7 +1063,7 @@ document.addEventListener('keydown',e=>{
   if((e.key==='/'&&!typing)||(e.key.toLowerCase()==='k'&&(e.ctrlKey||e.metaKey))){const i=$('#q');if(i){e.preventDefault();i.focus();i.select()}}
 });
 
-$('#file').addEventListener('change',async e=>{const fs=[...e.target.files];e.target.value='';await ajouterPhotos(fs,S.fileJour||today())});
+$('#file').addEventListener('change',async e=>{const fs=[...e.target.files];e.target.value='';await ajouterPhotos(fs,S.fileJour||dateParDefaut())});
 const hasFiles=e=>e.dataTransfer&&[...e.dataTransfer.types].includes('Files');
 const clearDrop=()=>document.querySelectorAll('.drop').forEach(x=>x.classList.remove('drop'));
 document.addEventListener('dragover',e=>{
@@ -911,18 +1075,19 @@ document.addEventListener('drop',e=>{
   if(!hasFiles(e))return;e.preventDefault();clearDrop();
   const t=e.target.closest&&e.target.closest('.ticket'),c=e.target.closest&&e.target.closest('.composer');
   if(t)ajouterPhotos(e.dataTransfer.files,t.dataset.jour);
-  else if(c)ajouterPhotos(e.dataTransfer.files,$('#f-jour').value||today());
+  else if(c)ajouterPhotos(e.dataTransfer.files,$('#f-jour').value||dateParDefaut());
 });
 document.addEventListener('paste',e=>{
   const fs=[...((e.clipboardData&&e.clipboardData.files)||[])].filter(f=>f.type.startsWith('image/'));
   if(!fs.length||!S.vid||!$('#composer'))return;
-  e.preventDefault();ajouterPhotos(fs,$('#f-jour').value||today());
+  e.preventDefault();ajouterPhotos(fs,$('#f-jour').value||dateParDefaut());
 });
 
 /* ---------- démarrage ---------- */
 async function init(){
   $('#b-new').innerHTML=ic('plus')+'Nouveau voyage';
   $('#b-quit').innerHTML=ic('power')+'Quitter';
+  $('#b-save').innerHTML=ic('disk')+'Sauvegarder mes données';
   try{
     const [r,v]=await Promise.all([api('GET','reglages'),api('GET','voyages')]);
     S.theme=THEMES.includes(r.theme)?r.theme:'auto';S.desc=r.ordre==='desc';applyTheme();
@@ -988,13 +1153,26 @@ def jour_iso(v):
         raise ValueError("Date invalide (format AAAA-MM-JJ).") from None
 
 
+def montant_optionnel(c, cle):
+    v = c.get(cle)
+    if v in (None, ""):
+        return None
+    try:
+        x = float(re.sub(r"\s+", "", str(v)).replace(",", ".").replace("€", ""))
+    except ValueError:
+        raise ValueError("Montant invalide.") from None
+    if not math.isfinite(x) or x < 0 or x > 1e9:
+        raise ValueError("Montant invalide.")
+    return x
+
+
 def champs_voyage(c):
     nom = texte(c, "nom", 80, True)
     debut = jour_iso(c["debut"]) if c.get("debut") else None
     fin = jour_iso(c["fin"]) if c.get("fin") else None
     if debut and fin and fin < debut:
         raise ValueError("La date de fin précède la date de début.")
-    return nom, texte(c, "pays", 80), debut, fin
+    return nom, texte(c, "pays", 80), debut, fin, montant_optionnel(c, "budget")
 
 
 def champs_note(c):
@@ -1005,7 +1183,7 @@ def champs_note(c):
     if humeur is not None and not 1 <= humeur <= 5:
         raise ValueError("L'humeur doit être comprise entre 1 et 5.")
     try:
-        depense = float(str(c.get("depense") or 0).replace(",", ".").replace("€", "").strip() or 0)
+        depense = float(re.sub(r"\s+", "", str(c.get("depense") or 0)).replace(",", ".").replace("€", "") or 0)
     except ValueError:
         raise ValueError("Montant invalide.") from None
     if not math.isfinite(depense) or abs(depense) > 1e9:
@@ -1015,13 +1193,14 @@ def champs_note(c):
         t = t.strip().lstrip("#").lower()
         if t and t not in tags:
             tags.append(t)
+    favori = 1 if c.get("favori") in (True, 1, "1", "true") else 0
     return (jour_iso(c.get("jour") or date.today().isoformat()), texte(c, "lieu", 120),
-            texte(c, "texte", 20000, True), humeur, depense, ",".join(tags[:12]) or None)
+            texte(c, "texte", 20000, True), humeur, depense, ",".join(tags[:12]) or None, favori)
 
 
 def lister_voyages(db):
     return [dict(r) for r in db.execute(
-        "SELECT v.id,v.nom,v.pays,v.debut,v.fin,COUNT(n.id) nb,COALESCE(SUM(n.depense),0) total "
+        "SELECT v.id,v.nom,v.pays,v.debut,v.fin,v.budget,v.couverture,COUNT(n.id) nb,COALESCE(SUM(n.depense),0) total "
         "FROM voyage v LEFT JOIN note n ON n.voyage_id=v.id GROUP BY v.id ORDER BY v.id DESC")]
 
 
@@ -1034,11 +1213,12 @@ def detail_voyage(db, vid, q):
     else:
         notes = db.execute("SELECT * FROM note WHERE voyage_id=? ORDER BY jour, id", (vid,)).fetchall()
     g = db.execute(
-        "SELECT COUNT(*) nb, COALESCE(SUM(depense),0) total, AVG(humeur) humeur, COUNT(DISTINCT lieu) lieux "
+        "SELECT COUNT(*) nb, COALESCE(SUM(depense),0) total, AVG(humeur) humeur, COUNT(DISTINCT lieu) lieux, "
+        "COALESCE(SUM(favori),0) favoris "
         "FROM note WHERE voyage_id=?", (vid,)).fetchone()
     stats = dict(g)
     stats["par_jour"] = [dict(r) for r in db.execute(
-        "SELECT jour, COUNT(*) nb, COALESCE(SUM(depense),0) total FROM note WHERE voyage_id=? "
+        "SELECT jour, COUNT(*) nb, COALESCE(SUM(depense),0) total, COALESCE(SUM(favori),0) favoris FROM note WHERE voyage_id=? "
         "GROUP BY jour ORDER BY jour", (vid,))]
     stats["top_lieux"] = [dict(r) for r in db.execute(
         "SELECT lieu, COUNT(*) nb FROM note WHERE voyage_id=? AND lieu IS NOT NULL "
@@ -1074,26 +1254,29 @@ def api(m, chemin, q, c):
                        "ON CONFLICT(cle) DO UPDATE SET valeur=excluded.valeur", (cle, val))
         return {"ok": True}
 
+    if p == ["sauvegarde"] and m == "GET":
+        return Fichier(f"carnet-sauvegarde-{date.today().isoformat()}.db", sauvegarde_octets(db), "application/octet-stream")
     if p == ["voyages"] and m == "GET":
         return {"voyages": lister_voyages(db)}
     if p == ["voyage"] and m == "POST":
-        nom, pays, debut, fin = champs_voyage(c)
+        nom, pays, debut, fin, budget = champs_voyage(c)
         with db:
             db.execute(
-                "INSERT INTO voyage(nom,pays,debut,fin) VALUES(?,?,?,?) ON CONFLICT(nom) DO UPDATE SET "
+                "INSERT INTO voyage(nom,pays,debut,fin,budget) VALUES(?,?,?,?,?) ON CONFLICT(nom) DO UPDATE SET "
                 "pays=COALESCE(excluded.pays,pays),debut=COALESCE(excluded.debut,debut),"
-                "fin=COALESCE(excluded.fin,fin)", (nom, pays, debut, fin))
+                "fin=COALESCE(excluded.fin,fin),budget=COALESCE(excluded.budget,budget)",
+                (nom, pays, debut, fin, budget))
         return {"id": db.execute("SELECT id FROM voyage WHERE nom=?", (nom,)).fetchone()["id"]}
     if len(p) == 2 and p[0] == "voyage" and num(1):
         vid = int(p[1])
         if m == "GET":
             return detail_voyage(db, vid, (q.get("q") or "").strip())
         if m == "PUT":
-            nom, pays, debut, fin = champs_voyage(c)
+            nom, pays, debut, fin, budget = champs_voyage(c)
             try:
                 with db:
-                    cur = db.execute("UPDATE voyage SET nom=?,pays=?,debut=?,fin=? WHERE id=?",
-                                     (nom, pays, debut, fin, vid))
+                    cur = db.execute("UPDATE voyage SET nom=?,pays=?,debut=?,fin=?,budget=? WHERE id=?",
+                                     (nom, pays, debut, fin, budget, vid))
             except sqlite3.IntegrityError:
                 raise Erreur(409, "Un voyage porte déjà ce nom.") from None
             if not cur.rowcount:
@@ -1103,6 +1286,20 @@ def api(m, chemin, q, c):
             with db:
                 db.execute("DELETE FROM voyage WHERE id=?", (vid,))
             return {"ok": True}
+    if len(p) == 3 and p[0] == "voyage" and num(1) and p[2] == "couverture" and m == "PUT":
+        vid = int(p[1])
+        pid = c.get("photo_id")
+        if pid in (None, ""):
+            pid = None
+        else:
+            pid = int(pid)
+            if not db.execute("SELECT 1 FROM photo WHERE id=? AND voyage_id=?", (pid, vid)).fetchone():
+                raise Erreur(404, "Photo introuvable.")
+        with db:
+            cur = db.execute("UPDATE voyage SET couverture=? WHERE id=?", (pid, vid))
+        if not cur.rowcount:
+            raise Erreur(404, "Voyage introuvable.")
+        return {"ok": True, "couverture": pid}
     if len(p) == 3 and p[0] == "voyage" and num(1) and p[2] == "export" and m == "GET":
         vid = int(p[1])
         v = db.execute("SELECT nom FROM voyage WHERE id=?", (vid,)).fetchone()
@@ -1129,15 +1326,23 @@ def api(m, chemin, q, c):
             raise Erreur(404, "Voyage introuvable.")
         with db:
             cur = db.execute(
-                "INSERT INTO note(voyage_id,jour,lieu,texte,humeur,depense,tags) VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO note(voyage_id,jour,lieu,texte,humeur,depense,tags,favori) VALUES(?,?,?,?,?,?,?,?)",
                 (vid, *champs_note(c)))
         return dict(db.execute("SELECT * FROM note WHERE id=?", (cur.lastrowid,)).fetchone())
+    if len(p) == 3 and p[0] == "note" and num(1) and p[2] == "favori" and m == "PUT":
+        nid = int(p[1])
+        with db:
+            cur = db.execute("UPDATE note SET favori=? WHERE id=?",
+                             (1 if c.get("favori") in (True, 1, "1", "true") else 0, nid))
+        if not cur.rowcount:
+            raise Erreur(404, "Note introuvable.")
+        return dict(db.execute("SELECT * FROM note WHERE id=?", (nid,)).fetchone())
     if len(p) == 2 and p[0] == "note" and num(1):
         nid = int(p[1])
         if m == "PUT":
             with db:
                 cur = db.execute(
-                    "UPDATE note SET jour=?,lieu=?,texte=?,humeur=?,depense=?,tags=? WHERE id=?",
+                    "UPDATE note SET jour=?,lieu=?,texte=?,humeur=?,depense=?,tags=?,favori=? WHERE id=?",
                     (*champs_note(c), nid))
             if not cur.rowcount:
                 raise Erreur(404, "Note introuvable.")
@@ -1169,6 +1374,7 @@ def api(m, chemin, q, c):
             return Fichier(None, row["mini"] if q.get("v") == "mini" else row["grande"], "image/jpeg", cache=True)
         if m == "DELETE":
             with db:
+                db.execute("UPDATE voyage SET couverture=NULL WHERE couverture=?", (pid,))
                 cur = db.execute("DELETE FROM photo WHERE id=?", (pid,))
             if not cur.rowcount:
                 raise Erreur(404, "Photo introuvable.")
